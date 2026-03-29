@@ -1,0 +1,5 @@
+flask
+instagrapi
+rich
+python-dotenv
+requests
