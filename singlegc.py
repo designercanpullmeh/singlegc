@@ -25,13 +25,15 @@ TITLE_FILE = os.getenv("TITLE_FILE", "nc.txt")
 GC_LIMIT = int(os.getenv("GC_LIMIT", "1"))
 MSG_DELAY = int(os.getenv("MSG_DELAY", "35"))
 GROUP_DELAY = int(os.getenv("GROUP_DELAY", "4"))
-NC_ACC_GAP = int(os.getenv("NC_ACC_GAP", "45"))  # 45s gap between accounts for NC
+NC_ACC_GAP = int(os.getenv("NC_ACC_GAP", "45"))  
 DOC_ID = os.getenv("DOC_ID", "29088580780787855")
 IG_APP_ID = os.getenv("IG_APP_ID", "936619743392459")
 FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")
 FLASK_PORT = int(os.environ.get("PORT", os.getenv("FLASK_PORT", 5000)))
 SELF_URL = os.getenv("SELF_URL")
 SELF_PING_INTERVAL = int(os.getenv("SELF_PING_INTERVAL", 100))
+NC_WINDOW = 180 
+SPAM_WINDOW = 40
 
 app = Flask(__name__)
 LOG_BUFFER = []
@@ -257,11 +259,14 @@ def rename_thread(cl, thread_id, title):
         return False
 
 
-async def message_loop(username, cl, get_groups, get_block):
+async def message_loop(username, cl, get_groups, get_block, my_idx, total_accounts):
     """
-    Sequential messages: GC1 send → wait MSG_DELAY → GC2 send → wait MSG_DELAY → ... → loop again.
-    Runs forever, completely independent of name change loop.
+    Staggered spam: all accounts cover SPAM_WINDOW seconds.
     """
+    # initial stagger so first run aligns within window
+    spam_offset = SPAM_WINDOW / total_accounts
+    await asyncio.sleep(my_idx * spam_offset)
+
     while True:
         groups = get_groups()
         total = len(groups)
@@ -286,35 +291,34 @@ async def message_loop(username, cl, get_groups, get_block):
                 ui_log(username, f"⚠ Send error GC {index}: {e}")
             else:
                 ui_log(username, f"📨 → GC {index}/{total}")
-            await asyncio.sleep(MSG_DELAY)
+            await asyncio.sleep(SPAM_WINDOW)
 
-
-# --------- NAMECHANGE LOOP (only this changed) ---------
-async def namechange_loop(username, cl, get_groups, get_titles, my_idx):
+async def namechange_loop(username, cl, get_groups, get_titles, my_idx, total_accounts):
     """
-    Turn-based NC across all accounts:
-    acc1 nc → wait 45s → acc2 nc → wait 45s → acc3 nc → wait 45s → acc4 nc → wait 45s → acc1 again...
-    1 GC only, no title checking, just rename directly with a random title from nc.txt
+    Staggered NC across all accounts within NC_WINDOW seconds.
     """
-    global _nc_current_idx
+    # per-account offset so N accounts fill NC_WINDOW
+    nc_offset = NC_WINDOW / total_accounts
 
-    # stagger start: acc1 starts at 0, acc2 at 45s, acc3 at 90s, acc4 at 135s
-    await asyncio.sleep(my_idx * NC_ACC_GAP)
+    # initial offset so:
+    # acc1:  nc_offset
+    # acc2:  2 * nc_offset
+    # ...
+    await asyncio.sleep(my_idx * nc_offset)
 
     while True:
         titles = get_titles()
         if not titles:
             ui_log(username, f"⚠ No titles in {TITLE_FILE}")
-            await asyncio.sleep(NC_ACC_GAP)
+            await asyncio.sleep(nc_offset)
             continue
 
         groups = get_groups()
         if not groups:
             ui_log(username, "⚠ No GCs found (NC loop)")
-            await asyncio.sleep(NC_ACC_GAP)
+            await asyncio.sleep(nc_offset)
             continue
 
-        # only 1 GC, take first one
         thread = groups[0]
         gid = thread.id
         new_title = random.choice(titles)
@@ -327,17 +331,11 @@ async def namechange_loop(username, cl, get_groups, get_titles, my_idx):
                 ui_log(username, f"⚠ NC failed")
         except Exception as e:
             ui_log(username, f"⚠ NC error: {e}")
-
-        # wait full cycle (4 accounts × 45s) before this account's next turn
-        await asyncio.sleep(len(USERS) * NC_ACC_GAP)
-# -------------------------------------------------------
+        await asyncio.sleep(NC_WINDOW)
 
 
-async def worker(username, password, proxy, cl, my_idx):
-    """
-    Spawns message_loop and namechange_loop in parallel for this account.
-    Both loops run forever and independently.
-    """
+async def worker(username, password, proxy, cl, my_idx, total_accounts):
+
     def get_groups():
         try:
             threads = cl.direct_threads(amount=100)
@@ -355,8 +353,8 @@ async def worker(username, password, proxy, cl, my_idx):
             return None
         return MESSAGE_BLOCKS[0]
 
-    msg_task = asyncio.create_task(message_loop(username, cl, get_groups, get_block))
-    nc_task = asyncio.create_task(namechange_loop(username, cl, get_groups, get_titles, my_idx))
+    msg_task = asyncio.create_task(message_loop(username, cl, get_groups, get_block, my_idx, total_accounts))
+    nc_task = asyncio.create_task(namechange_loop(username, cl, get_groups, get_titles, my_idx, total_accounts))
 
     await asyncio.gather(msg_task, nc_task)
 
@@ -380,10 +378,12 @@ async def main():
         print("DEBUG NO USERS, EXIT MAIN")
         return
 
+    total_accounts = len(USERS)
+
     layout = build_layout()
 
     for idx, (u, p, pr, cl) in enumerate(clients, start=1):
-        asyncio.create_task(worker(u, p, pr, cl, idx))
+        asyncio.create_task(worker(u, p, pr, cl, idx, total_accounts))
 
     with Live(layout, console=console, refresh_per_second=5, screen=True) as live:
         while True:
